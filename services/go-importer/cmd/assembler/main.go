@@ -3,11 +3,14 @@ package main
 import (
 	"go-importer/internal/converters"
 	"go-importer/internal/pkg/db"
+	"io"
 	"io/ioutil"
 	"runtime"
 
 	"github.com/gammazero/workerpool"
 
+	"crypto/cipher"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -44,6 +47,8 @@ var watch_dir = flag.String("dir", "", "Directory to watch for new pcaps")
 var timescale = flag.String("timescale", "", "Timescale connection string (e. g. postgres://usr:pwd@host:5432/tulip)")
 var flag_regex = flag.String("flag", "", "flag regex, used for flag in/out tagging")
 var pcap_over_ip = flag.String("pcap-over-ip", "", "PCAP-over-IP host + port (e.g. remote:1337)")
+var pcapEncryption = flag.Bool("pcap-encryption", false, "Decrypt the PCAP-over-IP stream (must match firewall config)")
+var pcapEncryptionScheme = flag.String("pcap-encryption-scheme", "aes-128-gcm", "PCAP-over-IP encryption scheme: aes-128-gcm or chacha20-poly1305")
 var bpf = flag.String("bpf", "", "BPF filter")
 var nonstrict = flag.Bool("nonstrict", false, "Do not check strict TCP / FSM flags")
 
@@ -90,6 +95,9 @@ While PostgreSQL technically supports values up to 1GiB, they are not very nice 
 var g_db *db.Database
 var workerPool *workerpool.WorkerPool
 var flagValidator FlagValidator
+
+// PCAP-over-IP decryption AEAD, nil when encryption is disabled
+var pcapAead cipher.AEAD
 
 // flagid caching (only once per tick)
 var flagids []db.FlagId
@@ -280,6 +288,31 @@ func main() {
 		*pcap_over_ip = os.Getenv("PCAP_OVER_IP")
 	}
 
+	// PCAP-over-IP encryption: toggle + scheme from env, key from PCAP_STREAM_KEY (hex)
+	if !*pcapEncryption {
+		v := os.Getenv("PCAP_ENCRYPTION")
+		*pcapEncryption = v != "" && v != "0" && !strings.EqualFold(v, "false")
+	}
+	if envScheme := os.Getenv("PCAP_ENCRYPTION_SCHEME"); envScheme != "" {
+		*pcapEncryptionScheme = envScheme
+	}
+	if *pcapEncryption {
+		keyHex := os.Getenv("PCAP_STREAM_KEY")
+		if keyHex == "" {
+			log.Fatal("PCAP encryption enabled but PCAP_STREAM_KEY is not set")
+		}
+		key, err := hex.DecodeString(keyHex)
+		if err != nil {
+			log.Fatal("Invalid PCAP_STREAM_KEY (must be hex): ", err)
+		}
+		aead, err := newPcapAEAD(*pcapEncryptionScheme, key)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pcapAead = aead
+		log.Println("PCAP-over-IP decryption enabled:", *pcapEncryptionScheme)
+	}
+
 	// if flagid scans should be done
 	if !*flagid {
 		flagid_val := os.Getenv("FLAGID_SCAN")
@@ -448,22 +481,42 @@ func connectToPCAPOverIP(service *AssemblerService, pcapIP string) {
 			continue
 		}
 
-		pcapFile, err := conn.File()
-		if err != nil {
-			log.Println(err)
-			conn.Close()
-			continue
-		}
-
 		// Name the file uniquely per connection to not skip packets on reconnect
 		sourceName := pcapIP + ":" + fmt.Sprintf("%d", time.Now().Unix())
 
 		log.Println("Connected to PCAP-over-IP:", sourceName)
 		service.PcapOverIp = true
-		service.HandlePcapFile(pcapFile, sourceName)
+
+		if pcapAead != nil {
+			// Encrypted stream: a goroutine decrypts frames and feeds the plaintext
+			// PCAP byte stream through a pipe, so the PCAP reader stays unchanged.
+			pr, pw, err := os.Pipe()
+			if err != nil {
+				log.Println(err)
+				conn.Close()
+				continue
+			}
+			go func() {
+				if err := decryptPcapStream(conn, pw, pcapAead); err != nil && err != io.EOF {
+					log.Println("PCAP-over-IP decrypt error:", err)
+				}
+			}()
+			service.HandlePcapFile(pr, sourceName)
+			pr.Close()
+		} else {
+			// Plaintext stream (original behaviour)
+			pcapFile, err := conn.File()
+			if err != nil {
+				log.Println(err)
+				conn.Close()
+				continue
+			}
+			service.HandlePcapFile(pcapFile, sourceName)
+			pcapFile.Close()
+		}
+
 		log.Println("Disconnected from PCAP-over-IP:", sourceName)
 		conn.Close()
-		pcapFile.Close()
 	}
 }
 

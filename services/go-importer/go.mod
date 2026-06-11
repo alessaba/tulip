@@ -15,6 +15,7 @@ require (
 	github.com/jackc/pgx/v5 v5.4.3
 	github.com/tidwall/gjson v1.14.1
 	github.com/vmihailenco/msgpack/v5 v5.3.5
+	golang.org/x/crypto v0.26.0
 )
 
 require (
@@ -25,7 +26,6 @@ require (
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
-	golang.org/x/crypto v0.26.0 // indirect
 	golang.org/x/net v0.28.0 // indirect
 	golang.org/x/sync v0.8.0 // indirect
 	golang.org/x/sys v0.24.0 // indirect
